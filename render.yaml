@@ -1,18 +1,3 @@
-# render.yaml — SockeText Blueprint
-#
-# O que este arquivo sobe:
-#   1. socketext-db       — PostgreSQL compartilhado (ambos os servidores lêem/escrevem aqui)
-#   2. socketext-primary  — Servidor Flask primário
-#   3. socketext-secondary — Servidor Flask secundário
-#   4. socketext-client   — Servidor HTTP estático com o frontend
-#
-# Como usar:
-#   1. Crie um novo "Blueprint" no Render apontando para este repositório
-#   2. O Render vai ler este arquivo e criar todos os serviços automaticamente
-#   3. Após o deploy, anote as URLs do primário e secundário
-#   4. Edite client/script.js (CONFIG.PRIMARY_URL e CONFIG.SECONDARY_URL)
-#      — ou use as variáveis de ambiente injetadas pelo client/render.yaml
-
 databases:
   - name: socketext-db
     databaseName: socketext
@@ -20,7 +5,6 @@ databases:
     plan: free
 
 services:
-  # ── Servidor Primário ───────────────────────────────────────────────
   - type: web
     name: socketext-primary
     runtime: python
@@ -38,7 +22,6 @@ services:
       - key: PYTHON_VERSION
         value: 3.11.0
 
-  # ── Servidor Secundário ─────────────────────────────────────────────
   - type: web
     name: socketext-secondary
     runtime: python
@@ -55,13 +38,14 @@ services:
         generateValue: true
       - key: PYTHON_VERSION
         value: 3.11.0
+      - key: PRIMARY_URL
+        value: https://socketext-primary.onrender.com
 
-  # ── Cliente Estático ────────────────────────────────────────────────
   - type: web
     name: socketext-client
     runtime: static
     rootDir: client
-    buildCommand: echo "No build step needed"
+    buildCommand: echo "static"
     staticPublishPath: .
     headers:
       - path: /*
