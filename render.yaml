@@ -1,0 +1,69 @@
+# render.yaml — SockeText Blueprint
+#
+# O que este arquivo sobe:
+#   1. socketext-db       — PostgreSQL compartilhado (ambos os servidores lêem/escrevem aqui)
+#   2. socketext-primary  — Servidor Flask primário
+#   3. socketext-secondary — Servidor Flask secundário
+#   4. socketext-client   — Servidor HTTP estático com o frontend
+#
+# Como usar:
+#   1. Crie um novo "Blueprint" no Render apontando para este repositório
+#   2. O Render vai ler este arquivo e criar todos os serviços automaticamente
+#   3. Após o deploy, anote as URLs do primário e secundário
+#   4. Edite client/script.js (CONFIG.PRIMARY_URL e CONFIG.SECONDARY_URL)
+#      — ou use as variáveis de ambiente injetadas pelo client/render.yaml
+
+databases:
+  - name: socketext-db
+    databaseName: socketext
+    user: socketext
+    plan: free
+
+services:
+  # ── Servidor Primário ───────────────────────────────────────────────
+  - type: web
+    name: socketext-primary
+    runtime: python
+    plan: free
+    rootDir: server_primary
+    buildCommand: pip install -r requirements.txt
+    startCommand: gunicorn --worker-class eventlet -w 1 --bind 0.0.0.0:$PORT app:app
+    envVars:
+      - key: DATABASE_URL
+        fromDatabase:
+          name: socketext-db
+          property: connectionString
+      - key: SECRET_KEY
+        generateValue: true
+      - key: PYTHON_VERSION
+        value: 3.11.0
+
+  # ── Servidor Secundário ─────────────────────────────────────────────
+  - type: web
+    name: socketext-secondary
+    runtime: python
+    plan: free
+    rootDir: server_secondary
+    buildCommand: pip install -r requirements.txt
+    startCommand: gunicorn --worker-class eventlet -w 1 --bind 0.0.0.0:$PORT app:app
+    envVars:
+      - key: DATABASE_URL
+        fromDatabase:
+          name: socketext-db
+          property: connectionString
+      - key: SECRET_KEY
+        generateValue: true
+      - key: PYTHON_VERSION
+        value: 3.11.0
+
+  # ── Cliente Estático ────────────────────────────────────────────────
+  - type: web
+    name: socketext-client
+    runtime: static
+    rootDir: client
+    buildCommand: echo "No build step needed"
+    staticPublishPath: .
+    headers:
+      - path: /*
+        name: Cache-Control
+        value: no-cache
