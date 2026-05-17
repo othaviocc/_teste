@@ -1,9 +1,5 @@
 """
-SockeText — Servidor Primário v4 (Corrigido)
-Melhorias:
-- Gerenciamento de usuários em memória (Thread-safe, sem locks de SQLite)
-- Confirmação de mensagem (ACK) via retorno direto da função
-- Broadcast de "server_shutdown" com tempo hábil para migração
+SockeText — Servidor Primário v4 (Sincronização de Salas Ativas)
 """
 import os, threading, time, signal
 from datetime import datetime, timezone
@@ -34,8 +30,8 @@ socketio = SocketIO(
 SERVER_ROLE = "primary"
 _killing = False
 
-# --- Gestão de estado em memória ---
 active_users = {}
+active_rooms = {"geral": "Geral"}
 
 class Message(db.Model):
     __tablename__ = "messages"
@@ -77,7 +73,6 @@ def kill_server():
             socketio.emit("server_shutdown", {"role": "primary"}, namespace="/")
         except Exception:
             pass
-        # Aguarda 1s para o evento chegar pela rede antes de matar o processo
         time.sleep(1.0)  
         os.kill(os.getpid(), signal.SIGTERM)
 
@@ -87,6 +82,20 @@ def kill_server():
 @socketio.on("connect")
 def on_connect():
     emit("server_info", {"role": SERVER_ROLE})
+    emit("room_list", [{"slug": k, "name": v} for k, v in active_rooms.items()])
+
+@socketio.on("create_room")
+def on_create_room(data):
+    name = data.get("name", "").strip()
+    if not name: 
+        return {"ok": False, "error": "Nome inválido"}
+    slug = name.lower().replace(" ", "-")[:24]
+    if not slug:
+        return {"ok": False, "error": "Nome inválido"}
+    if slug not in active_rooms:
+        active_rooms[slug] = name
+        socketio.emit("room_created", {"slug": slug, "name": name})
+    return {"ok": True, "slug": slug}
 
 @socketio.on("disconnect")
 def on_disconnect():
@@ -129,23 +138,19 @@ def on_message(data):
     db.session.commit()
 
     socketio.emit("message", msg.to_dict(), to=room)
-
-    # O SocketIO do Flask entende o return como o callback (ACK) para o cliente
     return {"ok": True, "server_id": msg.id, "client_msg_id": client_msg_id}
 
 @socketio.on("typing")
 def on_typing(data):
     user = active_users.get(request.sid)
     if not user: return
-    emit("typing", {"username": user["username"]},
-         to=data.get("room", "geral"), include_self=False)
+    emit("typing", {"username": user["username"]}, to=data.get("room", "geral"), include_self=False)
 
 @socketio.on("stop_typing")
 def on_stop_typing(data):
     user = active_users.get(request.sid)
     if not user: return
-    emit("stop_typing", {"username": user["username"]},
-         to=data.get("room", "geral"), include_self=False)
+    emit("stop_typing", {"username": user["username"]}, to=data.get("room", "geral"), include_self=False)
 
 def _get_users(room="geral"):
     return [u["username"] for sid, u in active_users.items() if u["room"] == room]

@@ -9,7 +9,6 @@
 </head>
 <body>
 
-  <!-- ── Modal de entrada ── -->
   <div class="modal-overlay" id="modalOverlay">
     <div class="modal-box">
       <div class="modal-logo">
@@ -24,8 +23,6 @@
       <p class="modal-sub" style="margin-top:12px">Escolha ou crie um grupo</p>
       <div class="room-list" id="roomList">
         <button class="room-chip active" data-room="geral">💬 Geral</button>
-        <button class="room-chip" data-room="off-topic">🎮 Off-topic</button>
-        <button class="room-chip" data-room="trabalho">💼 Trabalho</button>
         <button class="room-chip new-room-btn" id="newRoomBtn">＋ Novo grupo</button>
       </div>
       <div class="new-room-row" id="newRoomRow" style="display:none">
@@ -37,7 +34,6 @@
     </div>
   </div>
 
-  <!-- ── Chat ── -->
   <div class="chat-wrapper" id="chatWrapper" style="display:none">
     <div class="chat-header">
       <div class="header-logo">
@@ -82,7 +78,6 @@
 
     <div class="chat-messages" id="messages" role="log" aria-live="polite"></div>
 
-    <!-- Picker de emojis -->
     <div class="emoji-picker" id="emojiPicker" hidden>
       <div class="emoji-grid" id="emojiGrid"></div>
     </div>

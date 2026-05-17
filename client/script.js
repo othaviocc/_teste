@@ -29,8 +29,6 @@
 
   const outbox = new Map();
   let msgSeq = 0;
-  
-  // Impede duplicidade durante o failover
   const seenMessages = new Set();
 
   function getMessageKey(msg) {
@@ -94,9 +92,9 @@
   emojiPicker.addEventListener("click", e => e.stopPropagation());
 
   /* ══════════════════════════════════
-     GRUPOS NO MODAL
+     GERENCIAMENTO DE GRUPOS DINÂMICOS
   ══════════════════════════════════ */
-  const ROOM_EMOJIS = { "geral":"💬","off-topic":"🎮","trabalho":"💼" };
+  const ROOM_EMOJIS = { "geral":"💬" };
 
   roomList.addEventListener("click", e => {
     const chip = e.target.closest(".room-chip");
@@ -111,24 +109,36 @@
     newRoomInput.focus();
   });
 
-  function createRoom(name) {
-    const slug = name.trim().toLowerCase().replace(/\s+/g, "-").slice(0, 24);
-    if (!slug) return;
-    if (roomList.querySelector(`[data-room="${slug}"]`)) {
-      roomList.querySelectorAll(".room-chip").forEach(c =>
-        c.classList.toggle("active", c.dataset.room === slug));
-      currentRoom = slug;
-      return;
-    }
+  function addRoomChip(slug, name) {
+    if (roomList.querySelector(`[data-room="${slug}"]`)) return;
     const chip = document.createElement("button");
-    chip.className   = "room-chip active";
+    chip.className = "room-chip";
+    if (slug === currentRoom) chip.className += " active";
     chip.dataset.room = slug;
-    chip.textContent = "💬 " + name.trim();
-    roomList.querySelectorAll(".room-chip").forEach(c => c.classList.remove("active"));
+    chip.textContent = "💬 " + name;
     newRoomBtn.before(chip);
-    currentRoom = slug;
-    newRoomRow.style.display = "none";
-    newRoomInput.value = "";
+  }
+
+  function createRoom(name) {
+    const cleaned = name.trim();
+    if (!cleaned) return;
+
+    if (socket && socket.connected) {
+      socket.emit("create_room", { name: cleaned }, (ack) => {
+        if (ack && ack.ok) {
+          currentRoom = ack.slug;
+          setTimeout(() => {
+            const chip = roomList.querySelector(`[data-room="${ack.slug}"]`);
+            if (chip) {
+              roomList.querySelectorAll(".room-chip").forEach(c => c.classList.remove("active"));
+              chip.classList.add("active");
+            }
+          }, 50);
+          newRoomRow.style.display = "none";
+          newRoomInput.value = "";
+        }
+      });
+    }
   }
 
   newRoomConfirm.addEventListener("click", () => createRoom(newRoomInput.value));
@@ -152,7 +162,12 @@
 
     modalOverlay.style.display = "none";
     chatWrapper.style.display  = "flex";
-    connectTo("primary");
+    
+    if (socket && socket.connected) {
+      socket.emit("join", { username, room: currentRoom });
+    } else {
+      connectTo("primary");
+    }
   }
 
   joinBtn.addEventListener("click",   () => openChat(usernameInput.value));
@@ -175,7 +190,10 @@
       reconnecting = false;
       initRetries  = 0;
       setStatus("online");
-      socket.emit("join", { username, room: currentRoom });
+
+      if (username) {
+        socket.emit("join", { username, room: currentRoom });
+      }
 
       if (server === "primary") {
         hadConnection         = true;
@@ -235,6 +253,23 @@
 
     socket.on("server_info",  d => updateServerBadge(d.role === "primary" ? "primary" : "secondary"));
 
+    /* Sincronização em tempo real de salas criadas */
+    socket.on("room_list", rooms => {
+      roomList.querySelectorAll(".room-chip:not(#newRoomBtn)").forEach(c => {
+        if (c.dataset.room !== "geral") c.remove();
+      });
+      rooms.forEach(r => {
+        if (r.slug !== "geral") addRoomChip(r.slug, r.name);
+      });
+      roomList.querySelectorAll(".room-chip").forEach(c => {
+        c.classList.toggle("active", c.dataset.room === currentRoom);
+      });
+    });
+
+    socket.on("room_created", room => {
+      addRoomChip(room.slug, room.name);
+    });
+
     socket.on("history", messages => {
       renderHistory(messages);
     });
@@ -267,9 +302,7 @@
     connectTo("secondary");
   }
 
-  /* ══════════════════════════════════
-     OUTBOX
-  ══════════════════════════════════ */
+  /* ── OUTBOX ── */
   function flushOutbox() {
     if (outbox.size === 0) return;
     console.log(`[SockeText] Reenviando ${outbox.size} mensagem(ns) da outbox...`);
@@ -291,9 +324,7 @@
     });
   }
 
-  /* ══════════════════════════════════
-     BOTÃO KILL
-  ══════════════════════════════════ */
+  /* ── BOTÃO KILL ── */
   killBtn.addEventListener("click", () => {
     if (killBtn.disabled) return;
     if (!confirm("Derrubar o servidor primário?\nO chat migra automaticamente para o secundário.")) return;
@@ -306,9 +337,7 @@
     }).catch(() => {});
   });
 
-  /* ══════════════════════════════════
-     POLLING
-  ══════════════════════════════════ */
+  /* ── POLLING ── */
   function startReturnPoller() {
     stopReturnPoller();
     returnPoller = setTimeout(function poll() {
@@ -333,9 +362,7 @@
     if (returnPoller) { clearTimeout(returnPoller); returnPoller = null; }
   }
 
-  /* ══════════════════════════════════
-     ENVIO DE MENSAGEM
-  ══════════════════════════════════ */
+  /* ── ENVIO DE MENSAGEM ── */
   function sendMessage() {
     const text = inputEl.value.trim();
     if (!text) return;
@@ -364,9 +391,7 @@
     handleTyping();
   });
 
-  /* ══════════════════════════════════
-     TYPING
-  ══════════════════════════════════ */
+  /* ── TYPING ── */
   function handleTyping() {
     if (!socket || !socket.connected) return;
     if (!isTyping) { isTyping = true; socket.emit("typing", { room: currentRoom }); }
@@ -386,15 +411,11 @@
       `${others.join(", ")} estão digitando...`;
   }
 
-  /* ══════════════════════════════════
-     RENDERIZAÇÃO (CORRIGIDA)
-  ══════════════════════════════════ */
+  /* ── RENDERIZAÇÃO ── */
   function renderHistory(messages) {
     messages.forEach(msg => {
       renderMessage(msg);
     });
-    
-    // Re-garante que as mensagens pendentes ainda apareçam na ordem
     for (const [, entry] of outbox) {
       if (entry.el && !messagesEl.contains(entry.el)) {
         messagesEl.appendChild(entry.el);
@@ -405,7 +426,6 @@
 
   function renderMessage(msg) {
     const key = getMessageKey(msg);
-    
     const pendingKey = `${msg.sender}:${msg.text}`;
     const pending = messagesEl.querySelector(`[data-pending="${pendingKey}"]`);
     
@@ -461,9 +481,6 @@
     usersList.innerHTML = users.map(u => `<li>${escapeHTML(u)}</li>`).join("");
   }
 
-  /* ══════════════════════════════════
-     UI
-  ══════════════════════════════════ */
   function setStatus(state) {
     const colors = { online:"var(--green)", offline:"var(--danger)", connecting:"var(--warn)" };
     const labels = { online:"ao vivo", offline:"desconectado", connecting:"conectando..." };
@@ -498,9 +515,6 @@
 
   usersToggleBtn.addEventListener("click", () => { usersPanel.hidden = !usersPanel.hidden; });
 
-  /* ══════════════════════════════════
-     HELPERS
-  ══════════════════════════════════ */
   function getTime() {
     const d = new Date();
     return d.getHours().toString().padStart(2,"0") + ":" + d.getMinutes().toString().padStart(2,"0");
@@ -510,5 +524,8 @@
     return String(str).replace(/&/g,"&amp;").replace(/</g,"&lt;")
       .replace(/>/g,"&gt;").replace(/"/g,"&quot;");
   }
+
+  /* Conecta de imediato ao carregar a página para receber e sincronizar as salas disponíveis */
+  connectTo("primary");
 
 })();

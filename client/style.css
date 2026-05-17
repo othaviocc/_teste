@@ -63,7 +63,12 @@ body {
   align-items: center;
   gap: 16px;
   text-align: center;
+  max-height: 85vh; /* Aumenta dinamicamente e limita para não passar da tela */
+  overflow-y: auto; /* Adiciona scroll interno caso ultrapasse a altura limite */
 }
+
+.modal-box::-webkit-scrollbar { width: 4px; }
+.modal-box::-webkit-scrollbar-thumb { background: var(--border2); border-radius: 4px; }
 
 .modal-logo {
   width: 48px;
@@ -74,6 +79,7 @@ body {
   align-items: center;
   justify-content: center;
   color: #fff;
+  flex-shrink: 0;
 }
 
 .modal-box h2 {
@@ -82,10 +88,7 @@ body {
   color: var(--text);
 }
 
-.modal-box p {
-  font-size: 14px;
-  color: var(--text-2);
-}
+.modal-sub { font-size:13px; color:var(--text-2); align-self:flex-start; }
 
 .modal-box input {
   width: 100%;
@@ -104,7 +107,7 @@ body {
   border-color: var(--accent-dim);
 }
 
-.modal-box button {
+#joinBtn {
   width: 100%;
   background: var(--accent);
   border: none;
@@ -116,9 +119,10 @@ body {
   color: #fff;
   cursor: pointer;
   transition: background 0.15s;
+  flex-shrink: 0;
 }
 
-.modal-box button:hover { background: #6a58e0; }
+#joinBtn:hover { background: #6a58e0; }
 
 /* ── Wrapper ─────────────────────────────────────────────────────── */
 .chat-wrapper {
@@ -193,7 +197,6 @@ body {
   50%       { opacity: 0.4; }
 }
 
-/* Badge servidor ativo */
 .server-badge {
   font-family: var(--font-mono);
   font-size: 10px;
@@ -218,7 +221,6 @@ body {
   background: rgba(239,159,39,0.08);
 }
 
-/* Botão ícone (usuários) */
 .icon-btn {
   position: relative;
   background: transparent;
@@ -244,7 +246,6 @@ body {
   font-size: 11px;
 }
 
-/* Botão kill — destaque visual para demo */
 .kill-btn {
   display: flex;
   align-items: center;
@@ -377,7 +378,6 @@ body {
   color: var(--text-3);
 }
 
-/* Mensagem de sistema (entrou / saiu / failover) */
 .system-msg {
   align-self: center;
   font-family: var(--font-mono);
@@ -546,11 +546,15 @@ body {
 }
 
 /* ── Grupos no modal ── */
-.modal-sub { font-size:13px; color:var(--text-2); align-self:flex-start; }
-
 .room-list {
   display: flex; flex-wrap: wrap; gap: 6px; width: 100%; margin-top: 2px;
+  max-height: 180px; /* Impede os chips de estourarem o modal para baixo */
+  overflow-y: auto;  /* Habilita barra de scroll caso haja muitas salas */
+  padding-right: 4px;
 }
+.room-list::-webkit-scrollbar { width: 4px; }
+.room-list::-webkit-scrollbar-thumb { background: var(--border2); border-radius: 4px; }
+
 .room-chip {
   background: var(--surface2); border: 1px solid var(--border2);
   border-radius: 20px; padding: 5px 12px; font-size: 13px;
@@ -559,10 +563,10 @@ body {
 }
 .room-chip:hover  { border-color: var(--accent); color: var(--text); }
 .room-chip.active { background: rgba(124,106,247,0.15); border-color: var(--accent); color: var(--accent); }
-.new-room-btn     { border-style: dashed; }
+.new-room-btn     { border-style: dashed; flex-shrink: 0; }
 
 .new-room-row {
-  display: flex; gap: 8px; width: 100%; align-items: stretch;
+  display: flex; gap: 8px; width: 100%; align-items: stretch; flex-shrink: 0;
 }
 .new-room-row input {
   flex: 1; min-width: 0; width: 100%; background: var(--surface2); border: 1px solid var(--border2);
@@ -594,7 +598,7 @@ body {
   background: var(--surface2); border: 1px solid var(--border2);
   border-radius: var(--radius-md); padding: 10px;
   box-shadow: 0 8px 24px rgba(0,0,0,0.4); z-index: 50;
-  width: 290px;
+  width: 290px; /* Largura estendida para prevenir quebra de layout na direita */
 }
 .emoji-grid {
   display: grid; grid-template-columns: repeat(8, 1fr); gap: 2px;
@@ -606,5 +610,4 @@ body {
 }
 .emoji-item:hover { background: var(--border2); }
 
-/* Posição relativa no wrapper para o picker */
 .chat-wrapper { position: relative; }
