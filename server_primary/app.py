@@ -1,13 +1,14 @@
-"""
-SockeText — Servidor Primário v4 (Suspensão 60s + Replicação P2P)
-"""
-import os, threading, time
+# IMPORTANTE: O Monkey Patch precisa ser a PRIMEIRA coisa no arquivo
+import eventlet
+eventlet.monkey_patch()
+
+import os, time
 from datetime import datetime, timezone
 from flask import Flask, request, jsonify
 from flask_socketio import SocketIO, emit, join_room
 from flask_sqlalchemy import SQLAlchemy
 from flask_cors import CORS
-import requests as req_lib  # Necessário para replicar com o secundário
+import requests as req_lib
 
 app = Flask(__name__)
 app.config["SECRET_KEY"] = os.environ.get("SECRET_KEY", "socktext-primary-secret")
@@ -18,10 +19,11 @@ app.config["SQLALCHEMY_TRACK_MODIFICATIONS"] = False
 
 CORS(app, origins="*")
 db = SQLAlchemy(app)
+
+# Removemos o async_mode="threading" para o SocketIO usar o eventlet nativamente
 socketio = SocketIO(
     app,
     cors_allowed_origins="*",
-    async_mode="threading",
     logger=False,
     engineio_logger=False,
     ping_timeout=8,
@@ -133,7 +135,9 @@ def on_create_room(data):
             req_lib.post(f"{SECONDARY_URL}/internal/replicate_room", json={"slug": slug, "name": name}, timeout=3)
         except Exception as e:
             pass
-    threading.Thread(target=_sync, daemon=True).start()
+            
+    # Usando o gerenciador de background do SocketIO (substitui o import threading)
+    socketio.start_background_task(_sync)
         
     return {"ok": True, "slug": slug}
 
@@ -208,4 +212,4 @@ def _get_users(room="geral"):
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5001))
-    socketio.run(app, host="0.0.0.0", port=port, debug=False, allow_unsafe_werkzeug=True)
+    socketio.run(app, host="0.0.0.0", port=port, debug=False)
