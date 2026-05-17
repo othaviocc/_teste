@@ -16,7 +16,10 @@
   let reconnecting    = false;
   let typingUsers     = new Set();
   let historyLoaded   = false;
-  let failedOver      = false;   // true = já fez failover, não mostrar banner de novo
+  let hadConnection   = false;  // já conectou ao primário ao menos uma vez
+  let killedByButton  = false;  // botão foi clicado
+  let returnPoller    = null;
+  let _initialRetries = 0;
 
   /* ── DOM ── */
   const modalOverlay     = document.getElementById("modalOverlay");
@@ -56,7 +59,7 @@
   });
 
   /* ══════════════════════════════════════════════════════
-     CONEXÃO / FAILOVER
+     CONEXÃO
   ══════════════════════════════════════════════════════ */
   function connectTo(server) {
     const url = server === "primary" ? CONFIG.PRIMARY_URL : CONFIG.SECONDARY_URL;
@@ -77,31 +80,40 @@
     });
 
     socket.on("connect", () => {
-      reconnecting = false;
+      reconnecting    = false;
+      _initialRetries = 0;
       setStatus("online");
       socket.emit("join", { username, room: CONFIG.ROOM });
 
-      // Banner de failover: só aparece quando realmente migrou pro secundário
-      if (server === "secondary" && failedOver) {
-        showFailoverBanner("secundário");
-      }
-      // Banner de retorno ao primário
-      if (server === "primary" && failedOver) {
-        showReturnBanner();
-        failedOver = false;
+      if (server === "primary") {
+        hadConnection = true;
+        hideBanner();
+        if (killedByButton) {
+          killedByButton = false;
+          showReturnBanner();
+        }
+        killBtn.disabled      = false;
+        killBtn.style.opacity = "1";
+        stopReturnPoller();
       }
 
-      // Botão kill: só habilitado no primário
-      killBtn.disabled = (server === "secondary");
-      killBtn.style.opacity = (server === "secondary") ? "0.3" : "1";
+      if (server === "secondary") {
+        if (killedByButton) showFailoverBanner();
+        killBtn.disabled      = true;
+        killBtn.style.opacity = "0.3";
+        startReturnPoller();
+      }
     });
 
     socket.on("connect_error", () => {
       if (server === "primary" && !reconnecting) {
-        doFailover();
+        if (hadConnection) {
+          doFailover();
+        } else {
+          handleInitialConnectError();
+        }
       } else if (server === "secondary") {
         setStatus("offline");
-        // Tenta secundário de novo em 3s
         setTimeout(() => connectTo("secondary"), 3000);
       }
     });
@@ -116,73 +128,99 @@
       }
     });
 
-    /* ── Eventos da app ── */
-    socket.on("server_info", (data) => {
-      updateServerBadge(data.role === "primary" ? "primary" : "secondary");
-    });
+    socket.on("server_info",  (d) => updateServerBadge(d.role === "primary" ? "primary" : "secondary"));
+    socket.on("history",      (messages) => { renderHistory(messages); historyLoaded = true; });
+    socket.on("message",      renderMessage);
+    socket.on("user_list",    renderUserList);
+    socket.on("user_joined",  (d) => { if (d.username !== username) addSystemMessage(`${d.username} entrou no chat`); });
+    socket.on("user_left",    (d) => { if (d.username !== username) addSystemMessage(`${d.username} saiu do chat`); });
+    socket.on("typing",       (d) => { typingUsers.add(d.username);    updateTypingStatus(); });
+    socket.on("stop_typing",  (d) => { typingUsers.delete(d.username); updateTypingStatus(); });
+  }
 
-    socket.on("history", (messages) => {
-      renderHistory(messages);
-      historyLoaded = true;
-    });
-
-    socket.on("message", renderMessage);
-
-    socket.on("user_joined", (data) => {
-      // Só mostra "X entrou" se for outra pessoa
-      if (data.username !== username) {
-        addSystemMessage(`${data.username} entrou no chat`);
-      }
-    });
-
-    socket.on("user_left", (data) => {
-      if (data.username !== username) {
-        addSystemMessage(`${data.username} saiu do chat`);
-      }
-    });
-
-    socket.on("user_list", renderUserList);
-
-    socket.on("typing",      (d) => { typingUsers.add(d.username);    updateTypingStatus(); });
-    socket.on("stop_typing", (d) => { typingUsers.delete(d.username); updateTypingStatus(); });
-
-    // Secundário avisa que o primário voltou
-    socket.on("primary_back", () => {
-      if (currentServer === "secondary") {
-        addSystemMessage("🔄 Servidor primário voltou! Reconectando...", "warn");
-        reconnecting = false;
-        historyLoaded = false;
-        connectTo("primary");
-      }
-    });
+  function handleInitialConnectError() {
+    _initialRetries++;
+    if (_initialRetries < 3) {
+      setTimeout(() => connectTo("primary"), 3000);
+    } else {
+      _initialRetries = 0;
+      reconnecting = true;
+      connectTo("secondary");
+    }
   }
 
   function doFailover() {
     if (reconnecting) return;
-    reconnecting = true;
-    failedOver   = true;
-    setStatus("connecting");
+    reconnecting   = true;
+    killedByButton = true;
     connectTo("secondary");
   }
 
   /* ══════════════════════════════════════════════════════
-     BOTÃO KILL — fire-and-forget (não espera resposta)
+     BOTÃO KILL
+     Estratégia: fecha o WebSocket direto + dispara o fetch /admin/kill.
+     O socket fechando já é suficiente para disparar o failover.
+     O fetch é só para matar o processo no servidor mesmo.
   ══════════════════════════════════════════════════════ */
   killBtn.addEventListener("click", () => {
     if (killBtn.disabled) return;
-    if (!confirm("Derrubar o servidor primário agora?\nO chat vai migrar automaticamente para o secundário.")) return;
+    if (!confirm("Derrubar o servidor primário agora?\nO chat migra automaticamente para o secundário.")) return;
 
+    killedByButton   = true;
     killBtn.disabled = true;
     addSystemMessage("⚡ Derrubando servidor primário...", "warn");
 
-    // Fire-and-forget: não aguarda resposta (o servidor vai morrer antes de responder)
+    // 1. Fecha o socket manualmente — isso dispara o failover imediatamente
+    //    sem esperar o HTTP do /admin/kill
+    if (socket && socket.connected) {
+      socket.disconnect();
+    }
+
+    // 2. Manda o kill pro servidor em paralelo (fire-and-forget)
     fetch(`${CONFIG.PRIMARY_URL}/admin/kill`, {
       method: "POST",
       mode: "cors",
-      signal: AbortSignal.timeout(2000),
+      signal: AbortSignal.timeout(3000),
     }).catch(() => {});
-    // A desconexão do socket vai disparar o failover automaticamente
   });
+
+  /* ══════════════════════════════════════════════════════
+     POLLING PARA VOLTAR AO PRIMÁRIO
+     - Aguarda 60s (tempo que o Render leva pra reiniciar o serviço)
+     - Depois faz ping a cada 15s no /health do primário
+     - Quando responder online, reconecta automaticamente
+  ══════════════════════════════════════════════════════ */
+  function startReturnPoller() {
+    stopReturnPoller();
+    console.log("[SockeText] Aguardando 60s para o primário reiniciar...");
+
+    returnPoller = setTimeout(function poll() {
+      fetch(`${CONFIG.PRIMARY_URL}/health`, {
+        mode: "cors",
+        signal: AbortSignal.timeout(5000),
+      })
+        .then(r => r.json())
+        .then(data => {
+          if (data.status === "online") {
+            console.log("[SockeText] Primário online! Voltando...");
+            addSystemMessage("🔄 Servidor primário voltou! Reconectando...", "warn");
+            reconnecting  = false;
+            historyLoaded = false;
+            connectTo("primary");
+          } else {
+            returnPoller = setTimeout(poll, 15000);
+          }
+        })
+        .catch(() => {
+          console.log("[SockeText] Primário ainda offline, tentando em 15s...");
+          returnPoller = setTimeout(poll, 15000);
+        });
+    }, 60000); // 60s de espera inicial — tempo do Render reiniciar
+  }
+
+  function stopReturnPoller() {
+    if (returnPoller) { clearTimeout(returnPoller); returnPoller = null; }
+  }
 
   /* ══════════════════════════════════════════════════════
      ENVIO DE MENSAGEM
@@ -215,7 +253,6 @@
     clearTimeout(typingTimeout);
     typingTimeout = setTimeout(stopTyping, 2500);
   }
-
   function stopTyping() {
     if (isTyping && socket && socket.connected) {
       isTyping = false;
@@ -223,13 +260,11 @@
     }
     clearTimeout(typingTimeout);
   }
-
   function updateTypingStatus() {
     const others = [...typingUsers].filter(u => u !== username);
-    if (!others.length) { typingStatusEl.textContent = ""; return; }
-    typingStatusEl.textContent = others.length === 1
-      ? `${others[0]} está digitando...`
-      : `${others.join(", ")} estão digitando...`;
+    typingStatusEl.textContent = others.length === 0 ? "" :
+      others.length === 1 ? `${others[0]} está digitando...` :
+      `${others.join(", ")} estão digitando...`;
   }
 
   /* ══════════════════════════════════════════════════════
@@ -248,8 +283,7 @@
     row.className = `msg-row ${direction}`;
     const senderHTML = direction === "incoming"
       ? `<div class="msg-sender">${escapeHTML(msg.sender)}</div>` : "";
-    row.innerHTML = `
-      ${senderHTML}
+    row.innerHTML = `${senderHTML}
       <div class="msg-bubble">${escapeHTML(msg.text)}</div>
       <div class="msg-time">${msg.timestamp || getTime()}</div>`;
     messagesEl.appendChild(row);
@@ -284,25 +318,33 @@
     serverBadgeLabel.textContent = server === "primary" ? "primary" : "secondary";
   }
 
-  function showFailoverBanner(dest) {
-    failoverBanner.hidden = false;
-    failoverMsg.textContent = `Servidor primário caiu — usando ${dest} ✓`;
+  function showFailoverBanner() {
+    failoverBanner.hidden            = false;
+    failoverBanner.style.background  = "rgba(239,159,39,0.1)";
+    failoverBanner.style.borderColor = "rgba(239,159,39,0.25)";
+    failoverBanner.style.color       = "var(--warn)";
+    failoverMsg.textContent = "Servidor primário caiu — usando secundário ✓";
     addSystemMessage("🔄 Migrado para o servidor secundário — histórico preservado", "warn");
   }
 
   function showReturnBanner() {
-    failoverBanner.hidden = false;
-    failoverBanner.style.background = "rgba(63,207,142,0.1)";
+    failoverBanner.hidden            = false;
+    failoverBanner.style.background  = "rgba(63,207,142,0.1)";
     failoverBanner.style.borderColor = "rgba(63,207,142,0.25)";
-    failoverBanner.style.color = "var(--green)";
+    failoverBanner.style.color       = "var(--green)";
     failoverMsg.textContent = "Servidor primário voltou — reconectado ✓";
     addSystemMessage("✅ De volta ao servidor primário", "");
-    setTimeout(() => { failoverBanner.hidden = true; }, 5000);
+    setTimeout(hideBanner, 5000);
   }
 
-  usersToggleBtn.addEventListener("click", () => {
-    usersPanel.hidden = !usersPanel.hidden;
-  });
+  function hideBanner() {
+    failoverBanner.hidden            = true;
+    failoverBanner.style.background  = "";
+    failoverBanner.style.borderColor = "";
+    failoverBanner.style.color       = "";
+  }
+
+  usersToggleBtn.addEventListener("click", () => { usersPanel.hidden = !usersPanel.hidden; });
 
   /* ══════════════════════════════════════════════════════
      HELPERS
