@@ -1,5 +1,5 @@
 """
-SockeText — Servidor Secundário v4 (Grupos Eternos no BD + Validação de Criação)
+SockeText — Servidor Secundário v4 (Replicação P2P)
 """
 import os, threading, time, requests as req_lib
 from datetime import datetime, timezone
@@ -89,6 +89,19 @@ def index():
 def health():
     return jsonify({"status": "online", "role": SERVER_ROLE, "ts": time.time()})
 
+# Rota interna para sincronizar salas (P2P)
+@app.route("/internal/replicate_room", methods=["POST"])
+def replicate_room():
+    data = request.get_json() or {}
+    slug = data.get("slug")
+    name = data.get("name")
+    if slug and name:
+        if not ChatRoom.query.get(slug):
+            db.session.add(ChatRoom(slug=slug, name=name))
+            db.session.commit()
+            socketio.emit("room_created", {"slug": slug, "name": name})
+    return jsonify({"ok": True})
+
 @socketio.on("connect")
 def on_connect():
     global _primary_down, _monitor_thread
@@ -118,6 +131,14 @@ def on_create_room(data):
     db.session.add(ChatRoom(slug=slug, name=name))
     db.session.commit()
     socketio.emit("room_created", {"slug": slug, "name": name})
+    
+    # Se criaram grupo aqui durante failover, avisa o Primário (que está só suspenso, não morto)
+    def _sync():
+        try:
+            req_lib.post(f"{PRIMARY_URL}/internal/replicate_room", json={"slug": slug, "name": name}, timeout=3)
+        except Exception:
+            pass
+    threading.Thread(target=_sync, daemon=True).start()
         
     return {"ok": True, "slug": slug}
 

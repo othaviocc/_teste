@@ -43,7 +43,7 @@
   const newRoomRow       = document.getElementById("newRoomRow");
   const newRoomInput     = document.getElementById("newRoomInput");
   const newRoomConfirm   = document.getElementById("newRoomConfirm");
-  const modalError       = document.getElementById("modalError"); // NOVO
+  const modalError       = document.getElementById("modalError"); 
   const roomList         = document.getElementById("roomList");
   const chatWrapper      = document.getElementById("chatWrapper");
   const messagesEl       = document.getElementById("messages");
@@ -150,7 +150,6 @@
           newRoomInput.value = "";
           modalError.textContent = "";
         } else {
-          // Exibe o erro se o grupo já existir
           showError(ack.error || "Erro ao criar grupo.");
         }
       });
@@ -303,7 +302,7 @@
 
     socket.on("primary_back", () => {
       if (currentServer === "secondary") {
-        addSystemMsg("🔄 Servidor primário voltou! Reconectando...");
+        addSystemMsg("🔄 Servidor primário acordou! Reconectando...");
         reconnecting = false;
         connectTo("primary");
       }
@@ -315,7 +314,7 @@
     reconnecting = true;
     killedByUser = true;
     setStatus("connecting");
-    showBanner("warn", "⚠️ Servidor primário caiu — conectando ao secundário...");
+    showBanner("warn", "⚠️ Servidor primário suspenso — conectando ao secundário...");
     connectTo("secondary");
   }
 
@@ -340,14 +339,15 @@
     });
   }
 
-  /* ── BOTÃO KILL ── */
+  /* ── BOTÃO SUSPENDER (Ex-Kill) ── */
   killBtn.addEventListener("click", () => {
     if (killBtn.disabled) return;
-    if (!confirm("Derrubar o servidor primário?\nO chat migra automaticamente para o secundário.")) return;
+    if (!confirm("Suspender o servidor primário por 60 segundos?\nEle recusará todas as conexões e o failover será ativado.")) return;
 
     killBtn.disabled = true;
 
-    fetch(`${CONFIG.PRIMARY_URL}/admin/kill`, {
+    // Dispara para a nova rota que suspende o primário
+    fetch(`${CONFIG.PRIMARY_URL}/admin/suspend`, {
       method: "POST", mode: "cors",
       signal: AbortSignal.timeout(3000),
     }).catch(() => {});
@@ -363,7 +363,7 @@
         .then(r => r.json())
         .then(data => {
           if (data.status === "online") {
-            addSystemMsg("🔄 Servidor primário voltou! Reconectando...");
+            addSystemMsg("🔄 Servidor primário acordou! Reconectando...");
             reconnecting = false;
             connectTo("primary");
           } else {
@@ -371,7 +371,7 @@
           }
         })
         .catch(() => { returnPoller = setTimeout(poll, 15000); });
-    }, 60000);
+    }, 60000); // Tenta o primeiro check em 60 segundos exatos
   }
 
   function stopReturnPoller() {

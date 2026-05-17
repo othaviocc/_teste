@@ -1,12 +1,13 @@
 """
-SockeText — Servidor Primário v4 (Grupos Eternos no BD + Validação de Criação)
+SockeText — Servidor Primário v4 (Suspensão 60s + Replicação P2P)
 """
-import os, threading, time, signal
+import os, threading, time
 from datetime import datetime, timezone
 from flask import Flask, request, jsonify
 from flask_socketio import SocketIO, emit, join_room
 from flask_sqlalchemy import SQLAlchemy
 from flask_cors import CORS
+import requests as req_lib  # Necessário para replicar com o secundário
 
 app = Flask(__name__)
 app.config["SECRET_KEY"] = os.environ.get("SECRET_KEY", "socktext-primary-secret")
@@ -28,8 +29,10 @@ socketio = SocketIO(
 )
 
 SERVER_ROLE = "primary"
-_killing = False
+SECONDARY_URL = os.environ.get("SECONDARY_URL", "https://socketext-secondary.onrender.com")
 
+# Trava de suspensão (timestamp)
+_suspended_until = 0
 active_users = {}
 
 class ChatRoom(db.Model):
@@ -69,28 +72,40 @@ def index():
 
 @app.route("/health")
 def health():
+    # Se estiver no período de suspensão, reporta offline
+    if time.time() < _suspended_until:
+        return jsonify({"status": "offline", "role": SERVER_ROLE, "ts": time.time()})
     return jsonify({"status": "online", "role": SERVER_ROLE, "ts": time.time()})
 
-@app.route("/admin/kill", methods=["POST"])
-def kill_server():
-    global _killing
-    if _killing:
-        return jsonify({"msg": "ja encerrando"}), 200
-    _killing = True
+@app.route("/admin/suspend", methods=["POST"])
+def suspend_server():
+    global _suspended_until
+    # Suspende o servidor por 60 segundos
+    _suspended_until = time.time() + 60
+    
+    # Grita para os clientes migrarem
+    socketio.emit("server_shutdown", {"role": "primary"}, namespace="/")
+    return jsonify({"msg": "Servidor suspenso por 60 segundos"}), 200
 
-    def _die():
-        try:
-            socketio.emit("server_shutdown", {"role": "primary"}, namespace="/")
-        except Exception:
-            pass
-        time.sleep(1.0)  
-        os.kill(os.getpid(), signal.SIGTERM)
-
-    threading.Thread(target=_die, daemon=True).start()
-    return jsonify({"msg": "encerrando"}), 200
+# Rota interna para receber sincronização de salas do Secundário
+@app.route("/internal/replicate_room", methods=["POST"])
+def replicate_room():
+    data = request.get_json() or {}
+    slug = data.get("slug")
+    name = data.get("name")
+    if slug and name:
+        if not ChatRoom.query.get(slug):
+            db.session.add(ChatRoom(slug=slug, name=name))
+            db.session.commit()
+            socketio.emit("room_created", {"slug": slug, "name": name})
+    return jsonify({"ok": True})
 
 @socketio.on("connect")
 def on_connect():
+    # Rejeita conexão WebSocket se estiver suspenso
+    if time.time() < _suspended_until:
+        return False 
+        
     emit("server_info", {"role": SERVER_ROLE})
     rooms = [r.to_dict() for r in ChatRoom.query.all()]
     emit("room_list", rooms)
@@ -104,7 +119,6 @@ def on_create_room(data):
     if not slug:
         return {"ok": False, "error": "Nome de grupo inválido."}
     
-    # Validação rigorosa: Impede a re-criação do grupo se ele já existe
     existing = ChatRoom.query.get(slug)
     if existing:
         return {"ok": False, "error": f"O grupo '{name}' já existe! Escolha ele na lista."}
@@ -112,6 +126,14 @@ def on_create_room(data):
     db.session.add(ChatRoom(slug=slug, name=name))
     db.session.commit()
     socketio.emit("room_created", {"slug": slug, "name": name})
+    
+    # REPLICAÇÃO ATIVA: Avisa o Secundário que a sala foi criada
+    def _sync():
+        try:
+            req_lib.post(f"{SECONDARY_URL}/internal/replicate_room", json={"slug": slug, "name": name}, timeout=3)
+        except Exception as e:
+            pass
+    threading.Thread(target=_sync, daemon=True).start()
         
     return {"ok": True, "slug": slug}
 
@@ -126,6 +148,8 @@ def on_disconnect():
 
 @socketio.on("join")
 def on_join(data):
+    if time.time() < _suspended_until: return False
+
     uname = data.get("username", "Anônimo").strip()[:32]
     room  = data.get("room", "geral")
 
@@ -147,16 +171,16 @@ def on_join(data):
 
 @socketio.on("message")
 def on_message(data):
+    if time.time() < _suspended_until: return False
+
     user = active_users.get(request.sid)
-    if not user:
-        return
+    if not user: return
 
     text          = data.get("text", "").strip()
     room          = data.get("room", "geral")
     client_msg_id = data.get("client_msg_id")
 
-    if not text:
-        return
+    if not text: return
 
     msg = Message(sender=user["username"], text=text, room=room)
     db.session.add(msg)
@@ -167,12 +191,14 @@ def on_message(data):
 
 @socketio.on("typing")
 def on_typing(data):
+    if time.time() < _suspended_until: return False
     user = active_users.get(request.sid)
     if not user: return
     emit("typing", {"username": user["username"]}, to=data.get("room", "geral"), include_self=False)
 
 @socketio.on("stop_typing")
 def on_stop_typing(data):
+    if time.time() < _suspended_until: return False
     user = active_users.get(request.sid)
     if not user: return
     emit("stop_typing", {"username": user["username"]}, to=data.get("room", "geral"), include_self=False)
