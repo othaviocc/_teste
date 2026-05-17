@@ -19,23 +19,23 @@
   let currentRoom   = "geral";
   let currentServer = "primary";
   let reconnecting  = false;
-  let hadConnection = false;  // já conectou ao primário ao menos uma vez
-  let didFailover   = false;  // houve failover real (não primeira conexão)
+  let hadConnection = false;
+  let killedByUser  = false;
   let typingTimeout = null;
   let isTyping      = false;
   let typingUsers   = new Set();
   let returnPoller  = null;
   let initRetries   = 0;
-  let msgSeq        = 0;
 
-  /*
-   * OUTBOX: garante zero perda na transição de servidor.
-   * Cada mensagem enviada entra aqui com um client_msg_id único.
-   * Quando o servidor retorna a mensagem no broadcast com o mesmo
-   * client_msg_id, removemos da outbox e marcamos como entregue.
-   * Se o socket cair antes do ACK, flushOutbox() reenvia ao reconectar.
-   */
-  const outbox = new Map(); // clientMsgId → { text, room, el }
+  const outbox = new Map();
+  let msgSeq = 0;
+  
+  // Impede duplicidade durante o failover
+  const seenMessages = new Set();
+
+  function getMessageKey(msg) {
+    return `${msg.sender}::${msg.text}::${msg.timestamp || ""}`;
+  }
 
   /* ── DOM ── */
   const modalOverlay     = document.getElementById("modalOverlay");
@@ -73,11 +73,12 @@
   ══════════════════════════════════ */
   EMOJIS.forEach(e => {
     const btn = document.createElement("button");
-    btn.className = "emoji-item";
+    btn.className   = "emoji-item";
     btn.textContent = e;
     btn.addEventListener("click", () => {
       const pos = inputEl.selectionStart;
-      inputEl.value = inputEl.value.slice(0, pos) + e + inputEl.value.slice(pos);
+      const val = inputEl.value;
+      inputEl.value = val.slice(0, pos) + e + val.slice(pos);
       inputEl.focus();
       inputEl.setSelectionRange(pos + e.length, pos + e.length);
       emojiPicker.hidden = true;
@@ -85,7 +86,7 @@
     emojiGrid.appendChild(btn);
   });
 
-  emojiBtn.addEventListener("click", ev => {
+  emojiBtn.addEventListener("click", (ev) => {
     ev.stopPropagation();
     emojiPicker.hidden = !emojiPicker.hidden;
   });
@@ -95,7 +96,7 @@
   /* ══════════════════════════════════
      GRUPOS NO MODAL
   ══════════════════════════════════ */
-  const ROOM_EMOJIS = { "geral":"💬", "off-topic":"🎮", "trabalho":"💼" };
+  const ROOM_EMOJIS = { "geral":"💬","off-topic":"🎮","trabalho":"💼" };
 
   roomList.addEventListener("click", e => {
     const chip = e.target.closest(".room-chip");
@@ -110,24 +111,19 @@
     newRoomInput.focus();
   });
 
-  function createRoom(rawName) {
-    const name = rawName.trim();
-    const slug = name.toLowerCase().replace(/\s+/g, "-").slice(0, 24);
+  function createRoom(name) {
+    const slug = name.trim().toLowerCase().replace(/\s+/g, "-").slice(0, 24);
     if (!slug) return;
-    // Se já existe, só seleciona
-    const existing = roomList.querySelector(`[data-room="${slug}"]`);
-    if (existing) {
+    if (roomList.querySelector(`[data-room="${slug}"]`)) {
       roomList.querySelectorAll(".room-chip").forEach(c =>
         c.classList.toggle("active", c.dataset.room === slug));
       currentRoom = slug;
-      newRoomRow.style.display = "none";
-      newRoomInput.value = "";
       return;
     }
     const chip = document.createElement("button");
-    chip.className    = "room-chip active";
+    chip.className   = "room-chip active";
     chip.dataset.room = slug;
-    chip.textContent  = "💬 " + name;
+    chip.textContent = "💬 " + name.trim();
     roomList.querySelectorAll(".room-chip").forEach(c => c.classList.remove("active"));
     newRoomBtn.before(chip);
     currentRoom = slug;
@@ -136,9 +132,7 @@
   }
 
   newRoomConfirm.addEventListener("click", () => createRoom(newRoomInput.value));
-  newRoomInput.addEventListener("keydown", e => {
-    if (e.key === "Enter") createRoom(newRoomInput.value);
-  });
+  newRoomInput.addEventListener("keydown", e => { if (e.key === "Enter") createRoom(newRoomInput.value); });
 
   /* ══════════════════════════════════
      MODAL — ENTRAR
@@ -150,30 +144,25 @@
     const activeChip = roomList.querySelector(".room-chip.active");
     currentRoom = activeChip ? activeChip.dataset.room : "geral";
 
-    roomEmojiEl.textContent    = ROOM_EMOJIS[currentRoom] || "💬";
+    const emoji = ROOM_EMOJIS[currentRoom] || "💬";
+    roomEmojiEl.textContent  = emoji;
     headerRoomName.textContent = activeChip
-      ? activeChip.textContent.replace(/^.\s/, "").trim()
+      ? activeChip.textContent.replace(/^.\s/, "")
       : "Geral";
 
     modalOverlay.style.display = "none";
     chatWrapper.style.display  = "flex";
-
-    // Banner começa sempre escondido
-    hideBanner();
-
     connectTo("primary");
   }
 
-  joinBtn.addEventListener("click", () => openChat(usernameInput.value));
-  usernameInput.addEventListener("keydown", e => {
-    if (e.key === "Enter") openChat(usernameInput.value);
-  });
+  joinBtn.addEventListener("click",   () => openChat(usernameInput.value));
+  usernameInput.addEventListener("keydown", e => { if (e.key === "Enter") openChat(usernameInput.value); });
 
   /* ══════════════════════════════════
      CONEXÃO
   ══════════════════════════════════ */
   function connectTo(server) {
-    const url = server === "primary" ? CONFIG.PRIMARY_URL : CONFIG.SECONDARY_URL;
+    const url     = server === "primary" ? CONFIG.PRIMARY_URL : CONFIG.SECONDARY_URL;
     currentServer = server;
     setStatus("connecting");
     updateServerBadge(server);
@@ -182,7 +171,6 @@
 
     socket = io(url, { transports: ["websocket"], reconnection: false, timeout: 6000 });
 
-    /* ── Conectou ── */
     socket.on("connect", () => {
       reconnecting = false;
       initRetries  = 0;
@@ -195,44 +183,32 @@
         killBtn.style.opacity = "1";
         stopReturnPoller();
 
-        if (didFailover) {
-          didFailover = false;
+        if (killedByUser) {
+          killedByUser = false;
+          hideBanner();
           showBanner("green", "✅ Servidor primário voltou — reconectado");
-          addSystemMsg("✅ De volta ao servidor primário");
           setTimeout(hideBanner, 5000);
+          addSystemMsg("✅ De volta ao servidor primário");
         }
       }
 
       if (server === "secondary") {
         killBtn.disabled      = true;
         killBtn.style.opacity = "0.3";
-        // Banner de failover só se houve failover de verdade
-        if (didFailover) {
-          showBanner("warn", "⚠️ Servidor primário caiu — usando secundário ✓");
-          addSystemMsg("🔄 Migrado para o servidor secundário — histórico preservado");
-        }
         startReturnPoller();
       }
 
       flushOutbox();
     });
 
-    /* ── Erro de conexão ── */
     socket.on("connect_error", () => {
       if (server === "primary" && !reconnecting) {
         if (hadConnection) {
           triggerFailover();
         } else {
-          // Primário pode estar acordando (Render free tier) — tenta 3x
           initRetries++;
-          if (initRetries < 3) {
-            setTimeout(() => connectTo("primary"), 3000);
-          } else {
-            initRetries  = 0;
-            reconnecting = true;
-            // Vai pro secundário mas SEM mostrar banner (não é failover real)
-            connectTo("secondary");
-          }
+          if (initRetries < 3) setTimeout(() => connectTo("primary"), 2000);
+          else { initRetries = 0; reconnecting = true; connectTo("secondary"); }
         }
       } else if (server === "secondary") {
         setStatus("offline");
@@ -240,7 +216,6 @@
       }
     });
 
-    /* ── Desconectou ── */
     socket.on("disconnect", (reason) => {
       const dropped = ["transport close","transport error","ping timeout","io server disconnect"];
       if (server === "primary" && !reconnecting && dropped.includes(reason)) {
@@ -251,46 +226,28 @@
       }
     });
 
-    /* ── server_shutdown: primário avisa ANTES de morrer ── */
     socket.on("server_shutdown", () => {
       if (server === "primary" && !reconnecting) {
+        console.log("[SockeText] server_shutdown recebido — migrando ao secundário");
         triggerFailover();
       }
     });
 
-    /* ── Eventos da aplicação ── */
-    socket.on("server_info", d =>
-      updateServerBadge(d.role === "primary" ? "primary" : "secondary"));
+    socket.on("server_info",  d => updateServerBadge(d.role === "primary" ? "primary" : "secondary"));
 
-    socket.on("history", messages => renderHistory(messages));
+    socket.on("history", messages => {
+      renderHistory(messages);
+    });
 
     socket.on("message", msg => {
-      // ACK: se o client_msg_id bate com algo na outbox, confirma entrega
-      if (msg.client_msg_id && outbox.has(msg.client_msg_id)) {
-        const entry = outbox.get(msg.client_msg_id);
-        outbox.delete(msg.client_msg_id);
-        // Marca o bubble como entregue
-        if (entry.el) {
-          entry.el.classList.remove("pending");
-          entry.el.removeAttribute("data-cmid");
-          const timeEl = entry.el.querySelector(".msg-time");
-          if (timeEl) timeEl.textContent = msg.timestamp || getTime();
-        }
-      } else {
-        // Mensagem de outro usuário — renderiza normalmente
-        if (msg.sender !== username) renderMessage(msg);
-      }
+      renderMessage(msg);
     });
 
-    socket.on("user_joined", d => {
-      if (d.username !== username) addSystemMsg(`${d.username} entrou no chat`);
-    });
-    socket.on("user_left", d => {
-      if (d.username !== username) addSystemMsg(`${d.username} saiu do chat`);
-    });
-    socket.on("user_list",    renderUserList);
-    socket.on("typing",       d => { typingUsers.add(d.username);    updateTypingStatus(); });
-    socket.on("stop_typing",  d => { typingUsers.delete(d.username); updateTypingStatus(); });
+    socket.on("user_joined", d => { if (d.username !== username) addSystemMsg(`${d.username} entrou no chat`); });
+    socket.on("user_left",   d => { if (d.username !== username) addSystemMsg(`${d.username} saiu do chat`); });
+    socket.on("user_list",   renderUserList);
+    socket.on("typing",      d => { typingUsers.add(d.username);    updateTypingStatus(); });
+    socket.on("stop_typing", d => { typingUsers.delete(d.username); updateTypingStatus(); });
 
     socket.on("primary_back", () => {
       if (currentServer === "secondary") {
@@ -304,24 +261,34 @@
   function triggerFailover() {
     if (reconnecting) return;
     reconnecting = true;
-    didFailover  = true;
+    killedByUser = true;
     setStatus("connecting");
+    showBanner("warn", "⚠️ Servidor primário caiu — conectando ao secundário...");
     connectTo("secondary");
   }
 
   /* ══════════════════════════════════
-     OUTBOX — Zero perda na transição
+     OUTBOX
   ══════════════════════════════════ */
   function flushOutbox() {
-    if (!outbox.size) return;
+    if (outbox.size === 0) return;
+    console.log(`[SockeText] Reenviando ${outbox.size} mensagem(ns) da outbox...`);
     for (const [clientMsgId, entry] of outbox) {
-      _doEmit(entry.text, entry.room, clientMsgId);
+      _emitMessage(entry.text, entry.room, clientMsgId, entry.el);
     }
   }
 
-  function _doEmit(text, room, clientMsgId) {
+  function _emitMessage(text, room, clientMsgId, el) {
     if (!socket || !socket.connected) return;
-    socket.emit("message", { text, room, client_msg_id: clientMsgId });
+    socket.emit("message", { text, room, client_msg_id: clientMsgId }, (ack) => {
+      if (ack && ack.ok) {
+        outbox.delete(clientMsgId);
+        if (el) {
+          el.classList.remove("pending");
+          el.removeAttribute("data-pending");
+        }
+      }
+    });
   }
 
   /* ══════════════════════════════════
@@ -330,16 +297,17 @@
   killBtn.addEventListener("click", () => {
     if (killBtn.disabled) return;
     if (!confirm("Derrubar o servidor primário?\nO chat migra automaticamente para o secundário.")) return;
+
     killBtn.disabled = true;
+
     fetch(`${CONFIG.PRIMARY_URL}/admin/kill`, {
       method: "POST", mode: "cors",
       signal: AbortSignal.timeout(3000),
     }).catch(() => {});
-    // server_shutdown vai disparar triggerFailover() automaticamente
   });
 
   /* ══════════════════════════════════
-     POLLING — Retorno ao primário
+     POLLING
   ══════════════════════════════════ */
   function startReturnPoller() {
     stopReturnPoller();
@@ -358,7 +326,7 @@
           }
         })
         .catch(() => { returnPoller = setTimeout(poll, 15000); });
-    }, 60000); // 60s — tempo do Render reiniciar o processo
+    }, 60000);
   }
 
   function stopReturnPoller() {
@@ -377,15 +345,13 @@
     stopTyping();
 
     const clientMsgId = `${Date.now()}-${++msgSeq}`;
-
-    // Renderiza imediatamente como pending
     const el = renderPendingMessage(text, clientMsgId);
+
     outbox.set(clientMsgId, { text, room: currentRoom, el });
 
     if (socket && socket.connected) {
-      _doEmit(text, currentRoom, clientMsgId);
+      _emitMessage(text, currentRoom, clientMsgId, el);
     }
-    // Se desconectado, flushOutbox() reenvia ao reconectar
   }
 
   sendBtn.addEventListener("click", sendMessage);
@@ -421,37 +387,50 @@
   }
 
   /* ══════════════════════════════════
-     RENDERIZAÇÃO
+     RENDERIZAÇÃO (CORRIGIDA)
   ══════════════════════════════════ */
   function renderHistory(messages) {
-    const divider = messagesEl.querySelector(".date-divider");
-    messagesEl.innerHTML = "";
-    if (divider) messagesEl.appendChild(divider);
-
-    // Filtra msgs da outbox para não duplicar
-    const pendingIds = new Set([...outbox.keys()]);
     messages.forEach(msg => {
-      // Mensagens próprias que já estão pendentes na outbox: não renderiza de novo
-      if (msg.sender === username && msg.client_msg_id && pendingIds.has(msg.client_msg_id)) return;
       renderMessage(msg);
     });
-
-    // Recoloca os bubbles pendentes no final
+    
+    // Re-garante que as mensagens pendentes ainda apareçam na ordem
     for (const [, entry] of outbox) {
-      if (entry.el) messagesEl.appendChild(entry.el);
+      if (entry.el && !messagesEl.contains(entry.el)) {
+        messagesEl.appendChild(entry.el);
+      }
     }
     scrollToBottom();
   }
 
   function renderMessage(msg) {
+    const key = getMessageKey(msg);
+    
+    const pendingKey = `${msg.sender}:${msg.text}`;
+    const pending = messagesEl.querySelector(`[data-pending="${pendingKey}"]`);
+    
+    if (pending) {
+      pending.removeAttribute("data-pending");
+      pending.classList.remove("pending");
+      const timeEl = pending.querySelector(".msg-time");
+      if (timeEl) timeEl.textContent = msg.timestamp || getTime();
+      seenMessages.add(key);
+      return pending;
+    }
+
+    if (seenMessages.has(key)) return null; 
+    seenMessages.add(key);
+
     const direction = msg.sender === username ? "outgoing" : "incoming";
     const row = document.createElement("div");
     row.className = `msg-row ${direction}`;
     const senderHTML = direction === "incoming"
       ? `<div class="msg-sender">${escapeHTML(msg.sender)}</div>` : "";
+      
     row.innerHTML = `${senderHTML}
       <div class="msg-bubble">${escapeHTML(msg.text)}</div>
       <div class="msg-time">${msg.timestamp || getTime()}</div>`;
+      
     messagesEl.appendChild(row);
     scrollToBottom();
     return row;
@@ -459,8 +438,8 @@
 
   function renderPendingMessage(text, clientMsgId) {
     const row = document.createElement("div");
-    row.className       = "msg-row outgoing pending";
-    row.dataset.cmid    = clientMsgId;
+    row.className = "msg-row outgoing pending";
+    row.dataset.pending = `${username}:${text}`;
     row.innerHTML = `
       <div class="msg-bubble">${escapeHTML(text)}</div>
       <div class="msg-time">enviando...</div>`;
@@ -469,9 +448,9 @@
     return row;
   }
 
-  function addSystemMsg(text) {
+  function addSystemMsg(text, variant = "") {
     const el = document.createElement("div");
-    el.className   = "system-msg";
+    el.className = `system-msg${variant ? " " + variant : ""}`;
     el.textContent = text;
     messagesEl.appendChild(el);
     scrollToBottom();
@@ -498,9 +477,11 @@
   }
 
   function showBanner(type, msg) {
-    const s = type === "green"
-      ? { bg:"rgba(63,207,142,0.1)",  border:"rgba(63,207,142,0.3)",  color:"var(--green)" }
-      : { bg:"rgba(239,159,39,0.1)",  border:"rgba(239,159,39,0.3)",  color:"var(--warn)"  };
+    const styles = {
+      warn:  { bg:"rgba(239,159,39,0.1)",  border:"rgba(239,159,39,0.3)",  color:"var(--warn)"   },
+      green: { bg:"rgba(63,207,142,0.1)",  border:"rgba(63,207,142,0.3)",  color:"var(--green)"  },
+    };
+    const s = styles[type] || styles.warn;
     failoverBanner.hidden            = false;
     failoverBanner.style.background  = s.bg;
     failoverBanner.style.borderColor = s.border;

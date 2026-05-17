@@ -1,10 +1,9 @@
 """
-SockeText — Servidor Primário v4
-Melhorias críticas:
-- Confirmação de mensagem (ACK) via callback do Socket.IO
-- Broadcast de "server_shutdown" antes de morrer (clientes migram antes do TCP fechar)
-- Limpeza de usuários órfãos no startup
-- /health com CORS explícito para polling do cliente
+SockeText — Servidor Primário v4 (Corrigido)
+Melhorias:
+- Gerenciamento de usuários em memória (Thread-safe, sem locks de SQLite)
+- Confirmação de mensagem (ACK) via retorno direto da função
+- Broadcast de "server_shutdown" com tempo hábil para migração
 """
 import os, threading, time, signal
 from datetime import datetime, timezone
@@ -35,6 +34,8 @@ socketio = SocketIO(
 SERVER_ROLE = "primary"
 _killing = False
 
+# --- Gestão de estado em memória ---
+active_users = {}
 
 class Message(db.Model):
     __tablename__ = "messages"
@@ -53,23 +54,8 @@ class Message(db.Model):
             "room":      self.room,
         }
 
-
-class ActiveUser(db.Model):
-    __tablename__ = "active_users"
-    sid      = db.Column(db.String(128), primary_key=True)
-    username = db.Column(db.String(64), nullable=False)
-    room     = db.Column(db.String(64), default="geral")
-    joined   = db.Column(db.DateTime, default=lambda: datetime.now(timezone.utc))
-
-
 with app.app_context():
     db.create_all()
-    try:
-        db.session.query(ActiveUser).delete()
-        db.session.commit()
-    except Exception:
-        db.session.rollback()
-
 
 @app.route("/")
 def index():
@@ -87,19 +73,16 @@ def kill_server():
     _killing = True
 
     def _die():
-        # 1. Avisa TODOS os clientes conectados para migrarem AGORA
-        #    Isso acontece antes do TCP fechar — clientes recebem o evento
-        #    e iniciam a reconexão ao secundário antes de perder a conexão
         try:
             socketio.emit("server_shutdown", {"role": "primary"}, namespace="/")
         except Exception:
             pass
-        time.sleep(0.3)  # aguarda o evento chegar nos clientes
+        # Aguarda 1s para o evento chegar pela rede antes de matar o processo
+        time.sleep(1.0)  
         os.kill(os.getpid(), signal.SIGTERM)
 
     threading.Thread(target=_die, daemon=True).start()
     return jsonify({"msg": "encerrando"}), 200
-
 
 @socketio.on("connect")
 def on_connect():
@@ -107,12 +90,10 @@ def on_connect():
 
 @socketio.on("disconnect")
 def on_disconnect():
-    user = ActiveUser.query.get(request.sid)
+    user = active_users.pop(request.sid, None)
     if user:
-        uname = user.username
-        room  = user.room
-        db.session.delete(user)
-        db.session.commit()
+        uname = user["username"]
+        room  = user["room"]
         socketio.emit("user_left", {"username": uname}, to=room)
         socketio.emit("user_list", _get_users(room), to=room)
 
@@ -121,18 +102,7 @@ def on_join(data):
     uname = data.get("username", "Anônimo").strip()[:32]
     room  = data.get("room", "geral")
 
-    for stale in ActiveUser.query.filter_by(username=uname).all():
-        if stale.sid != request.sid:
-            db.session.delete(stale)
-
-    existing = ActiveUser.query.get(request.sid)
-    if existing:
-        existing.username = uname
-        existing.room     = room
-    else:
-        db.session.add(ActiveUser(sid=request.sid, username=uname, room=room))
-    db.session.commit()
-
+    active_users[request.sid] = {"username": uname, "room": room}
     join_room(room)
 
     msgs = (Message.query.filter_by(room=room)
@@ -142,52 +112,43 @@ def on_join(data):
     socketio.emit("user_list", _get_users(room), to=room)
 
 @socketio.on("message")
-def on_message(data, *args):
-    """
-    Aceita callback (ACK) do Socket.IO.
-    Fluxo: cliente envia {text, room, client_msg_id}
-           servidor salva no banco
-           servidor faz broadcast
-           servidor chama callback({"ok": True, "id": msg.id})
-           cliente remove da outbox ao receber ACK
-    """
-    user = ActiveUser.query.get(request.sid)
+def on_message(data):
+    user = active_users.get(request.sid)
     if not user:
         return
 
     text          = data.get("text", "").strip()
     room          = data.get("room", "geral")
-    client_msg_id = data.get("client_msg_id")  # ID local do cliente para ACK
+    client_msg_id = data.get("client_msg_id")
 
     if not text:
         return
 
-    msg = Message(sender=user.username, text=text, room=room)
+    msg = Message(sender=user["username"], text=text, room=room)
     db.session.add(msg)
     db.session.commit()
 
     socketio.emit("message", msg.to_dict(), to=room)
 
-    # Confirma para o remetente que a mensagem foi persistida
-    if args and callable(args[0]):
-        args[0]({"ok": True, "server_id": msg.id, "client_msg_id": client_msg_id})
+    # O SocketIO do Flask entende o return como o callback (ACK) para o cliente
+    return {"ok": True, "server_id": msg.id, "client_msg_id": client_msg_id}
 
 @socketio.on("typing")
 def on_typing(data):
-    user = ActiveUser.query.get(request.sid)
+    user = active_users.get(request.sid)
     if not user: return
-    emit("typing", {"username": user.username},
+    emit("typing", {"username": user["username"]},
          to=data.get("room", "geral"), include_self=False)
 
 @socketio.on("stop_typing")
 def on_stop_typing(data):
-    user = ActiveUser.query.get(request.sid)
+    user = active_users.get(request.sid)
     if not user: return
-    emit("stop_typing", {"username": user.username},
+    emit("stop_typing", {"username": user["username"]},
          to=data.get("room", "geral"), include_self=False)
 
 def _get_users(room="geral"):
-    return [u.username for u in ActiveUser.query.filter_by(room=room).all()]
+    return [u["username"] for sid, u in active_users.items() if u["room"] == room]
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5001))
