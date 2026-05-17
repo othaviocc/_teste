@@ -5,12 +5,11 @@
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>SockeText</title>
   <link rel="stylesheet" href="style.css" />
-  <!-- Socket.IO client — versão compatível com Flask-SocketIO 5.x -->
   <script src="https://cdn.socket.io/4.7.4/socket.io.min.js"></script>
 </head>
 <body>
 
-  <!-- ── Modal de identificação ─────────────────────────────────── -->
+  <!-- ── Modal de entrada ── -->
   <div class="modal-overlay" id="modalOverlay">
     <div class="modal-box">
       <div class="modal-logo">
@@ -19,99 +18,93 @@
         </svg>
       </div>
       <h2>SockeText</h2>
-      <p>Como você quer ser chamado?</p>
-      <input
-        type="text"
-        id="usernameInput"
-        placeholder="Seu nome..."
-        maxlength="32"
-        autocomplete="off"
-        autofocus
-      />
+      <p class="modal-sub">Como você quer ser chamado?</p>
+      <input type="text" id="usernameInput" placeholder="Seu nome..." maxlength="32" autocomplete="off" autofocus />
+
+      <p class="modal-sub" style="margin-top:12px">Escolha ou crie um grupo</p>
+      <div class="room-list" id="roomList">
+        <button class="room-chip active" data-room="geral">💬 Geral</button>
+        <button class="room-chip" data-room="off-topic">🎮 Off-topic</button>
+        <button class="room-chip" data-room="trabalho">💼 Trabalho</button>
+        <button class="room-chip new-room-btn" id="newRoomBtn">＋ Novo grupo</button>
+      </div>
+      <div class="new-room-row" id="newRoomRow" style="display:none">
+        <input type="text" id="newRoomInput" placeholder="Nome do grupo..." maxlength="24" />
+        <button id="newRoomConfirm">Criar</button>
+      </div>
+
       <button id="joinBtn">Entrar no chat</button>
     </div>
   </div>
 
-  <!-- ── Chat ───────────────────────────────────────────────────── -->
+  <!-- ── Chat ── -->
   <div class="chat-wrapper" id="chatWrapper" style="display:none">
-
     <div class="chat-header">
       <div class="header-logo">
-        <svg width="20" height="20" viewBox="0 0 20 20" fill="none" aria-hidden="true">
-          <path d="M10 2L12.5 7.5H18L13.5 11L15.5 17L10 13.5L4.5 17L6.5 11L2 7.5H7.5L10 2Z" fill="currentColor"/>
-        </svg>
+        <span id="roomEmoji">💬</span>
       </div>
       <div class="header-info">
-        <span class="header-name">SockeText</span>
+        <span class="header-name" id="headerRoomName">Geral</span>
         <span class="header-status">
           <span class="status-dot" id="statusDot"></span>
           <span id="statusLabel">conectando...</span>
         </span>
       </div>
-
-      <!-- Badge do servidor ativo -->
-      <div class="server-badge" id="serverBadge" title="Servidor ativo">
-        <span id="serverBadgeLabel">—</span>
-      </div>
-
-      <!-- Botão de usuários online -->
-      <button class="icon-btn" id="usersToggleBtn" title="Usuários online" aria-label="Ver usuários online">
-        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+      <div class="server-badge" id="serverBadge"><span id="serverBadgeLabel">—</span></div>
+      <button class="icon-btn" id="usersToggleBtn" title="Usuários online">
+        <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
           <path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"/>
           <circle cx="9" cy="7" r="4"/>
-          <path d="M23 21v-2a4 4 0 0 0-3-3.87"/>
-          <path d="M16 3.13a4 4 0 0 1 0 7.75"/>
+          <path d="M23 21v-2a4 4 0 0 0-3-3.87"/><path d="M16 3.13a4 4 0 0 1 0 7.75"/>
         </svg>
         <span class="users-count" id="usersCount">0</span>
       </button>
-
-      <!-- Botão de derrubar servidor — para demo do trabalho -->
-      <button class="kill-btn" id="killBtn" title="Derrubar servidor primário (demo)">
-        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5">
-          <path d="M18.36 6.64a9 9 0 1 1-12.73 0"/>
-          <line x1="12" y1="2" x2="12" y2="12"/>
+      <button class="kill-btn" id="killBtn">
+        <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5">
+          <path d="M18.36 6.64a9 9 0 1 1-12.73 0"/><line x1="12" y1="2" x2="12" y2="12"/>
         </svg>
         <span>Derrubar Primário</span>
       </button>
     </div>
 
-    <!-- Painel de usuários online (colapsável) -->
     <div class="users-panel" id="usersPanel" hidden>
       <div class="users-panel-title">Online agora</div>
       <ul class="users-list" id="usersList"></ul>
     </div>
 
-    <!-- Banner de failover -->
     <div class="failover-banner" id="failoverBanner" hidden>
-      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+      <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
         <path d="M10.29 3.86L1.82 18a2 2 0 001.71 3h16.94a2 2 0 001.71-3L13.71 3.86a2 2 0 00-3.42 0z"/>
         <line x1="12" y1="9" x2="12" y2="13"/><line x1="12" y1="17" x2="12.01" y2="17"/>
       </svg>
-      <span id="failoverMsg">Servidor primário caiu — conectado ao secundário</span>
+      <span id="failoverMsg"></span>
     </div>
 
-    <div class="chat-messages" id="messages" role="log" aria-live="polite" aria-label="Mensagens do chat">
-      <div class="date-divider"><span>Hoje</span></div>
+    <div class="chat-messages" id="messages" role="log" aria-live="polite"></div>
+
+    <!-- Picker de emojis -->
+    <div class="emoji-picker" id="emojiPicker" hidden>
+      <div class="emoji-grid" id="emojiGrid"></div>
     </div>
 
     <div class="chat-footer">
       <div class="typing-status" id="typingStatus"></div>
-      <div class="input-row" id="inputRow">
-        <textarea
-          class="msg-input"
-          id="msgInput"
-          placeholder="Mensagem..."
-          rows="1"
-          aria-label="Escreva sua mensagem"
-        ></textarea>
-        <button class="send-btn" id="sendBtn" aria-label="Enviar mensagem">
-          <svg width="16" height="16" viewBox="0 0 16 16" fill="none" aria-hidden="true">
+      <div class="input-row">
+        <button class="emoji-btn" id="emojiBtn" title="Emojis">
+          <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+            <circle cx="12" cy="12" r="10"/>
+            <path d="M8 13s1.5 2 4 2 4-2 4-2"/>
+            <line x1="9" y1="9" x2="9.01" y2="9"/><line x1="15" y1="9" x2="15.01" y2="9"/>
+          </svg>
+        </button>
+        <textarea class="msg-input" id="msgInput" placeholder="Mensagem..." rows="1" aria-label="Escreva sua mensagem"></textarea>
+        <button class="send-btn" id="sendBtn">
+          <svg width="16" height="16" viewBox="0 0 16 16" fill="none">
             <path d="M14 8L2 2L5 8L2 14L14 8Z" fill="currentColor"/>
           </svg>
         </button>
       </div>
     </div>
-
   </div>
 
   <script src="script.js"></script>

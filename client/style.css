@@ -544,3 +544,67 @@ body {
   .chat-wrapper { border-radius: 0; height: 100dvh; max-width: 100%; }
   .kill-btn span { display: none; }
 }
+
+/* ── Grupos no modal ── */
+.modal-sub { font-size:13px; color:var(--text-2); align-self:flex-start; }
+
+.room-list {
+  display: flex; flex-wrap: wrap; gap: 6px; width: 100%; margin-top: 2px;
+}
+.room-chip {
+  background: var(--surface2); border: 1px solid var(--border2);
+  border-radius: 20px; padding: 5px 12px; font-size: 13px;
+  font-family: var(--font); color: var(--text-2); cursor: pointer;
+  transition: all 0.15s;
+}
+.room-chip:hover  { border-color: var(--accent); color: var(--text); }
+.room-chip.active { background: rgba(124,106,247,0.15); border-color: var(--accent); color: var(--accent); }
+.new-room-btn     { border-style: dashed; }
+
+.new-room-row {
+  display: flex; gap: 6px; width: 100%;
+}
+.new-room-row input {
+  flex: 1; background: var(--surface2); border: 1px solid var(--border2);
+  border-radius: var(--radius-sm); padding: 7px 10px; font-size: 13px;
+  font-family: var(--font); color: var(--text); outline: none;
+}
+.new-room-row input:focus { border-color: var(--accent-dim); }
+.new-room-row button {
+  background: var(--accent); border: none; border-radius: var(--radius-sm);
+  padding: 7px 14px; font-size: 13px; font-family: var(--font);
+  color: #fff; cursor: pointer;
+}
+
+/* ── Mensagem pending (outbox) ── */
+.msg-row.pending .msg-bubble { opacity: 0.55; }
+.msg-row.pending .msg-time   { opacity: 0.4; font-style: italic; }
+
+/* ── Emoji picker ── */
+.emoji-btn {
+  background: transparent; border: none; color: var(--text-3);
+  cursor: pointer; padding: 4px 6px; border-radius: var(--radius-sm);
+  display: flex; align-items: center; flex-shrink: 0;
+  transition: color 0.15s;
+}
+.emoji-btn:hover { color: var(--accent); }
+
+.emoji-picker {
+  position: absolute; bottom: 70px; left: 14px;
+  background: var(--surface2); border: 1px solid var(--border2);
+  border-radius: var(--radius-md); padding: 10px;
+  box-shadow: 0 8px 24px rgba(0,0,0,0.4); z-index: 50;
+  width: 260px;
+}
+.emoji-grid {
+  display: grid; grid-template-columns: repeat(8, 1fr); gap: 2px;
+}
+.emoji-item {
+  background: transparent; border: none; font-size: 18px;
+  cursor: pointer; padding: 4px; border-radius: 4px;
+  transition: background 0.1s; line-height: 1;
+}
+.emoji-item:hover { background: var(--border2); }
+
+/* Posição relativa no wrapper para o picker */
+.chat-wrapper { position: relative; }

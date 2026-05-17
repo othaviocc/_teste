@@ -1,16 +1,10 @@
 """
-SockeText — Servidor Secundário
-Mesmas correções do primário.
-Adicionado: polling para detectar quando o primário voltou e avisar os clientes.
+SockeText — Servidor Secundário v4
+Mesmas funcionalidades do primário.
+Adiciona: polling para detectar quando primário voltou → emite primary_back.
 """
-
-import os
-import threading
-import time
-import signal
-import requests
+import os, threading, time, requests as req_lib
 from datetime import datetime, timezone
-
 from flask import Flask, request, jsonify
 from flask_socketio import SocketIO, emit, join_room
 from flask_sqlalchemy import SQLAlchemy
@@ -19,7 +13,7 @@ from flask_cors import CORS
 app = Flask(__name__)
 app.config["SECRET_KEY"] = os.environ.get("SECRET_KEY", "socktext-secondary-secret")
 app.config["SQLALCHEMY_DATABASE_URI"] = os.environ.get(
-    "DATABASE_URL", "sqlite:///chat_secondary.db"
+    "DATABASE_URL", "sqlite:///chat_sec.db"
 ).replace("postgres://", "postgresql://")
 app.config["SQLALCHEMY_TRACK_MODIFICATIONS"] = False
 
@@ -35,12 +29,10 @@ socketio = SocketIO(
     ping_interval=4,
 )
 
-SERVER_ROLE = "secondary"
-PRIMARY_URL = os.environ.get("PRIMARY_URL", "https://socketext-primary.onrender.com")
-
-# Controla se o primário estava fora e voltou
-_primary_was_down = False
-_monitor_started  = False
+SERVER_ROLE  = "secondary"
+PRIMARY_URL  = os.environ.get("PRIMARY_URL", "https://socketext-primary.onrender.com")
+_primary_down   = False
+_monitor_thread = None
 
 
 class Message(db.Model):
@@ -65,6 +57,7 @@ class ActiveUser(db.Model):
     __tablename__ = "active_users"
     sid      = db.Column(db.String(128), primary_key=True)
     username = db.Column(db.String(64), nullable=False)
+    room     = db.Column(db.String(64), default="geral")
     joined   = db.Column(db.DateTime, default=lambda: datetime.now(timezone.utc))
 
 
@@ -73,40 +66,32 @@ with app.app_context():
     try:
         db.session.query(ActiveUser).delete()
         db.session.commit()
-        print("[SECONDARY] Startup: active_users limpos.", flush=True)
-    except Exception as e:
+    except Exception:
         db.session.rollback()
-        print(f"[SECONDARY] Aviso startup: {e}", flush=True)
 
 
-# ── Monitor do primário ───────────────────────────────────────────────────────
 def _monitor_primary():
     """
-    Roda em thread separada.
-    Verifica a cada 15s se o primário voltou.
-    Quando detecta que voltou, emite "primary_back" para todos os clientes
-    conectados ao secundário — o cliente JS então migra de volta sozinho.
+    Roda em thread daemon.
+    Após 60s (tempo do Render reiniciar), faz GET /health no primário a cada 15s.
+    Quando primário volta: emite primary_back para todos os clientes no secundário.
     """
-    global _primary_was_down
-    time.sleep(20)  # aguarda o secundário estabilizar antes de começar
-
+    global _primary_down
+    time.sleep(60)
+    print("[SECONDARY] Iniciando monitor do primário...", flush=True)
     while True:
         time.sleep(15)
         try:
-            r = requests.get(f"{PRIMARY_URL}/health", timeout=4)
-            if r.status_code == 200:
-                if _primary_was_down:
-                    print("[SECONDARY] Primário voltou! Avisando clientes...", flush=True)
-                    _primary_was_down = False
-                    with app.app_context():
-                        socketio.emit("primary_back", {"url": PRIMARY_URL}, namespace="/")
-            else:
-                _primary_was_down = True
+            r = req_lib.get(f"{PRIMARY_URL}/health", timeout=5)
+            if r.status_code == 200 and r.json().get("status") == "online":
+                if _primary_down:
+                    print("[SECONDARY] Primário voltou — notificando clientes", flush=True)
+                    _primary_down = False
+                    socketio.emit("primary_back", {"url": PRIMARY_URL}, namespace="/")
         except Exception:
-            _primary_was_down = True
+            _primary_down = True
 
 
-# ── HTTP Routes ───────────────────────────────────────────────────────────────
 @app.route("/")
 def index():
     return jsonify({"status": "online", "role": SERVER_ROLE})
@@ -116,89 +101,85 @@ def health():
     return jsonify({"status": "online", "role": SERVER_ROLE, "ts": time.time()})
 
 
-# ── WebSocket Events ──────────────────────────────────────────────────────────
 @socketio.on("connect")
 def on_connect():
-    global _monitor_started, _primary_was_down
-    print(f"[SECONDARY] + {request.sid}", flush=True)
+    global _primary_down, _monitor_thread
+    _primary_down = True
     emit("server_info", {"role": SERVER_ROLE})
 
-    # Marca que o primário estava fora (alguém conectou no secundário)
-    _primary_was_down = True
-
-    # Inicia o monitor só uma vez
-    if not _monitor_started:
-        _monitor_started = True
-        t = threading.Thread(target=_monitor_primary, daemon=True)
-        t.start()
-        print("[SECONDARY] Monitor do primário iniciado.", flush=True)
+    if _monitor_thread is None or not _monitor_thread.is_alive():
+        _monitor_thread = threading.Thread(target=_monitor_primary, daemon=True)
+        _monitor_thread.start()
 
 @socketio.on("disconnect")
 def on_disconnect():
     user = ActiveUser.query.get(request.sid)
     if user:
         uname = user.username
+        room  = user.room
         db.session.delete(user)
         db.session.commit()
-        socketio.emit("user_left", {"username": uname}, to="geral")
-        socketio.emit("user_list", _get_users(), to="geral")
+        socketio.emit("user_left", {"username": uname}, to=room)
+        socketio.emit("user_list", _get_users(room), to=room)
 
 @socketio.on("join")
 def on_join(data):
-    username = data.get("username", "Anônimo").strip()[:32]
-    room     = data.get("room", "geral")
+    uname = data.get("username", "Anônimo").strip()[:32]
+    room  = data.get("room", "geral")
 
-    for stale in ActiveUser.query.filter_by(username=username).all():
+    for stale in ActiveUser.query.filter_by(username=uname).all():
         if stale.sid != request.sid:
             db.session.delete(stale)
 
     existing = ActiveUser.query.get(request.sid)
     if existing:
-        existing.username = username
+        existing.username = uname
+        existing.room     = room
     else:
-        db.session.add(ActiveUser(sid=request.sid, username=username))
+        db.session.add(ActiveUser(sid=request.sid, username=uname, room=room))
     db.session.commit()
 
     join_room(room)
 
-    msgs = (
-        Message.query.filter_by(room=room)
-        .order_by(Message.timestamp.asc()).limit(50).all()
-    )
+    msgs = (Message.query.filter_by(room=room)
+            .order_by(Message.timestamp.asc()).limit(80).all())
     emit("history", [m.to_dict() for m in msgs])
-
-    emit("user_joined", {"username": username}, to=room, include_self=False)
-    socketio.emit("user_list", _get_users(), to=room)
-    print(f"[SECONDARY] {username} entrou", flush=True)
+    emit("user_joined", {"username": uname}, to=room, include_self=False)
+    socketio.emit("user_list", _get_users(room), to=room)
 
 @socketio.on("message")
-def on_message(data):
+def on_message(data, *args):
     user = ActiveUser.query.get(request.sid)
     if not user:
         return
-    text = data.get("text", "").strip()
-    room = data.get("room", "geral")
+    text          = data.get("text", "").strip()
+    room          = data.get("room", "geral")
+    client_msg_id = data.get("client_msg_id")
     if not text:
         return
     msg = Message(sender=user.username, text=text, room=room)
     db.session.add(msg)
     db.session.commit()
     socketio.emit("message", msg.to_dict(), to=room)
+    if args and callable(args[0]):
+        args[0]({"ok": True, "server_id": msg.id, "client_msg_id": client_msg_id})
 
 @socketio.on("typing")
 def on_typing(data):
     user = ActiveUser.query.get(request.sid)
     if not user: return
-    emit("typing", {"username": user.username}, to=data.get("room","geral"), include_self=False)
+    emit("typing", {"username": user.username},
+         to=data.get("room", "geral"), include_self=False)
 
 @socketio.on("stop_typing")
 def on_stop_typing(data):
     user = ActiveUser.query.get(request.sid)
     if not user: return
-    emit("stop_typing", {"username": user.username}, to=data.get("room","geral"), include_self=False)
+    emit("stop_typing", {"username": user.username},
+         to=data.get("room", "geral"), include_self=False)
 
-def _get_users():
-    return [u.username for u in ActiveUser.query.all()]
+def _get_users(room="geral"):
+    return [u.username for u in ActiveUser.query.filter_by(room=room).all()]
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5002))

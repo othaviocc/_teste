@@ -1,17 +1,13 @@
 """
-SockeText — Servidor Primário
-Correções:
-- Limpa active_users órfãos no startup (evita usuário duplicado)
-- /admin/kill responde imediatamente e mata em 150ms (kill mais rápido)
-- user_joined só emite para os OUTROS (não dispara para o próprio usuário)
+SockeText — Servidor Primário v4
+Melhorias críticas:
+- Confirmação de mensagem (ACK) via callback do Socket.IO
+- Broadcast de "server_shutdown" antes de morrer (clientes migram antes do TCP fechar)
+- Limpeza de usuários órfãos no startup
+- /health com CORS explícito para polling do cliente
 """
-
-import os
-import threading
-import time
-import signal
+import os, threading, time, signal
 from datetime import datetime, timezone
-
 from flask import Flask, request, jsonify
 from flask_socketio import SocketIO, emit, join_room
 from flask_sqlalchemy import SQLAlchemy
@@ -62,6 +58,7 @@ class ActiveUser(db.Model):
     __tablename__ = "active_users"
     sid      = db.Column(db.String(128), primary_key=True)
     username = db.Column(db.String(64), nullable=False)
+    room     = db.Column(db.String(64), default="geral")
     joined   = db.Column(db.DateTime, default=lambda: datetime.now(timezone.utc))
 
 
@@ -70,10 +67,8 @@ with app.app_context():
     try:
         db.session.query(ActiveUser).delete()
         db.session.commit()
-        print("[PRIMARY] Startup: active_users limpos.", flush=True)
-    except Exception as e:
+    except Exception:
         db.session.rollback()
-        print(f"[PRIMARY] Aviso startup: {e}", flush=True)
 
 
 @app.route("/")
@@ -90,16 +85,24 @@ def kill_server():
     if _killing:
         return jsonify({"msg": "ja encerrando"}), 200
     _killing = True
+
     def _die():
-        time.sleep(0.15)
+        # 1. Avisa TODOS os clientes conectados para migrarem AGORA
+        #    Isso acontece antes do TCP fechar — clientes recebem o evento
+        #    e iniciam a reconexão ao secundário antes de perder a conexão
+        try:
+            socketio.emit("server_shutdown", {"role": "primary"}, namespace="/")
+        except Exception:
+            pass
+        time.sleep(0.3)  # aguarda o evento chegar nos clientes
         os.kill(os.getpid(), signal.SIGTERM)
+
     threading.Thread(target=_die, daemon=True).start()
     return jsonify({"msg": "encerrando"}), 200
 
 
 @socketio.on("connect")
 def on_connect():
-    print(f"[PRIMARY] + {request.sid}", flush=True)
     emit("server_info", {"role": SERVER_ROLE})
 
 @socketio.on("disconnect")
@@ -107,69 +110,84 @@ def on_disconnect():
     user = ActiveUser.query.get(request.sid)
     if user:
         uname = user.username
+        room  = user.room
         db.session.delete(user)
         db.session.commit()
-        socketio.emit("user_left", {"username": uname}, to="geral")
-        socketio.emit("user_list", _get_users(), to="geral")
+        socketio.emit("user_left", {"username": uname}, to=room)
+        socketio.emit("user_list", _get_users(room), to=room)
 
 @socketio.on("join")
 def on_join(data):
-    username = data.get("username", "Anônimo").strip()[:32]
-    room     = data.get("room", "geral")
+    uname = data.get("username", "Anônimo").strip()[:32]
+    room  = data.get("room", "geral")
 
-    # Remove sessões duplicadas do mesmo username
-    for stale in ActiveUser.query.filter_by(username=username).all():
+    for stale in ActiveUser.query.filter_by(username=uname).all():
         if stale.sid != request.sid:
             db.session.delete(stale)
 
     existing = ActiveUser.query.get(request.sid)
     if existing:
-        existing.username = username
+        existing.username = uname
+        existing.room     = room
     else:
-        db.session.add(ActiveUser(sid=request.sid, username=username))
+        db.session.add(ActiveUser(sid=request.sid, username=uname, room=room))
     db.session.commit()
 
     join_room(room)
 
-    msgs = (
-        Message.query.filter_by(room=room)
-        .order_by(Message.timestamp.asc()).limit(50).all()
-    )
+    msgs = (Message.query.filter_by(room=room)
+            .order_by(Message.timestamp.asc()).limit(80).all())
     emit("history", [m.to_dict() for m in msgs])
-
-    # Só notifica os OUTROS que alguém entrou (não o próprio)
-    emit("user_joined", {"username": username}, to=room, include_self=False)
-    socketio.emit("user_list", _get_users(), to=room)
-    print(f"[PRIMARY] {username} entrou", flush=True)
+    emit("user_joined", {"username": uname}, to=room, include_self=False)
+    socketio.emit("user_list", _get_users(room), to=room)
 
 @socketio.on("message")
-def on_message(data):
+def on_message(data, *args):
+    """
+    Aceita callback (ACK) do Socket.IO.
+    Fluxo: cliente envia {text, room, client_msg_id}
+           servidor salva no banco
+           servidor faz broadcast
+           servidor chama callback({"ok": True, "id": msg.id})
+           cliente remove da outbox ao receber ACK
+    """
     user = ActiveUser.query.get(request.sid)
     if not user:
         return
-    text = data.get("text", "").strip()
-    room = data.get("room", "geral")
+
+    text          = data.get("text", "").strip()
+    room          = data.get("room", "geral")
+    client_msg_id = data.get("client_msg_id")  # ID local do cliente para ACK
+
     if not text:
         return
+
     msg = Message(sender=user.username, text=text, room=room)
     db.session.add(msg)
     db.session.commit()
+
     socketio.emit("message", msg.to_dict(), to=room)
+
+    # Confirma para o remetente que a mensagem foi persistida
+    if args and callable(args[0]):
+        args[0]({"ok": True, "server_id": msg.id, "client_msg_id": client_msg_id})
 
 @socketio.on("typing")
 def on_typing(data):
     user = ActiveUser.query.get(request.sid)
     if not user: return
-    emit("typing", {"username": user.username}, to=data.get("room","geral"), include_self=False)
+    emit("typing", {"username": user.username},
+         to=data.get("room", "geral"), include_self=False)
 
 @socketio.on("stop_typing")
 def on_stop_typing(data):
     user = ActiveUser.query.get(request.sid)
     if not user: return
-    emit("stop_typing", {"username": user.username}, to=data.get("room","geral"), include_self=False)
+    emit("stop_typing", {"username": user.username},
+         to=data.get("room", "geral"), include_self=False)
 
-def _get_users():
-    return [u.username for u in ActiveUser.query.all()]
+def _get_users(room="geral"):
+    return [u.username for u in ActiveUser.query.filter_by(room=room).all()]
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5001))
