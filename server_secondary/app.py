@@ -1,5 +1,5 @@
 """
-SockeText — Servidor Secundário v4 (Sincronização de Salas Ativas)
+SockeText — Servidor Secundário v4 (Grupos Eternos no BD + Validação de Criação)
 """
 import os, threading, time, requests as req_lib
 from datetime import datetime, timezone
@@ -33,7 +33,14 @@ _primary_down   = False
 _monitor_thread = None
 
 active_users = {}
-active_rooms = {"geral": "Geral"}
+
+class ChatRoom(db.Model):
+    __tablename__ = "rooms"
+    slug = db.Column(db.String(64), primary_key=True)
+    name = db.Column(db.String(64), nullable=False)
+
+    def to_dict(self):
+        return {"slug": self.slug, "name": self.name}
 
 class Message(db.Model):
     __tablename__ = "messages"
@@ -54,6 +61,9 @@ class Message(db.Model):
 
 with app.app_context():
     db.create_all()
+    if not ChatRoom.query.get("geral"):
+        db.session.add(ChatRoom(slug="geral", name="Geral"))
+        db.session.commit()
 
 def _monitor_primary():
     global _primary_down
@@ -84,7 +94,9 @@ def on_connect():
     global _primary_down, _monitor_thread
     _primary_down = True
     emit("server_info", {"role": SERVER_ROLE})
-    emit("room_list", [{"slug": k, "name": v} for k, v in active_rooms.items()])
+    
+    rooms = [r.to_dict() for r in ChatRoom.query.all()]
+    emit("room_list", rooms)
 
     if _monitor_thread is None or not _monitor_thread.is_alive():
         _monitor_thread = threading.Thread(target=_monitor_primary, daemon=True)
@@ -94,13 +106,19 @@ def on_connect():
 def on_create_room(data):
     name = data.get("name", "").strip()
     if not name: 
-        return {"ok": False, "error": "Nome inválido"}
+        return {"ok": False, "error": "Nome de grupo inválido."}
     slug = name.lower().replace(" ", "-")[:24]
     if not slug:
-        return {"ok": False, "error": "Nome inválido"}
-    if slug not in active_rooms:
-        active_rooms[slug] = name
-        socketio.emit("room_created", {"slug": slug, "name": name})
+        return {"ok": False, "error": "Nome de grupo inválido."}
+        
+    existing = ChatRoom.query.get(slug)
+    if existing:
+        return {"ok": False, "error": f"O grupo '{name}' já existe! Escolha ele na lista."}
+        
+    db.session.add(ChatRoom(slug=slug, name=name))
+    db.session.commit()
+    socketio.emit("room_created", {"slug": slug, "name": name})
+        
     return {"ok": True, "slug": slug}
 
 @socketio.on("disconnect")
@@ -116,6 +134,13 @@ def on_disconnect():
 def on_join(data):
     uname = data.get("username", "Anônimo").strip()[:32]
     room  = data.get("room", "geral")
+
+    existing = ChatRoom.query.get(room)
+    if not existing:
+        name = room.replace("-", " ").title()
+        db.session.add(ChatRoom(slug=room, name=name))
+        db.session.commit()
+        socketio.emit("room_created", {"slug": room, "name": name})
 
     active_users[request.sid] = {"username": uname, "room": room}
     join_room(room)

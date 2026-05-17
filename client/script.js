@@ -43,6 +43,7 @@
   const newRoomRow       = document.getElementById("newRoomRow");
   const newRoomInput     = document.getElementById("newRoomInput");
   const newRoomConfirm   = document.getElementById("newRoomConfirm");
+  const modalError       = document.getElementById("modalError"); // NOVO
   const roomList         = document.getElementById("roomList");
   const chatWrapper      = document.getElementById("chatWrapper");
   const messagesEl       = document.getElementById("messages");
@@ -65,6 +66,14 @@
   const typingStatusEl   = document.getElementById("typingStatus");
   const roomEmojiEl      = document.getElementById("roomEmoji");
   const headerRoomName   = document.getElementById("headerRoomName");
+
+  /* ══════════════════════════════════
+     FUNÇÃO DE ERRO
+  ══════════════════════════════════ */
+  function showError(msg) {
+    modalError.textContent = msg;
+    setTimeout(() => { modalError.textContent = ""; }, 4000);
+  }
 
   /* ══════════════════════════════════
      EMOJI PICKER
@@ -121,7 +130,10 @@
 
   function createRoom(name) {
     const cleaned = name.trim();
-    if (!cleaned) return;
+    if (!cleaned) {
+      showError("Por favor, digite um nome para o grupo.");
+      return;
+    }
 
     if (socket && socket.connected) {
       socket.emit("create_room", { name: cleaned }, (ack) => {
@@ -136,6 +148,10 @@
           }, 50);
           newRoomRow.style.display = "none";
           newRoomInput.value = "";
+          modalError.textContent = "";
+        } else {
+          // Exibe o erro se o grupo já existir
+          showError(ack.error || "Erro ao criar grupo.");
         }
       });
     }
@@ -149,7 +165,10 @@
   ══════════════════════════════════ */
   function openChat(name) {
     username = name.trim();
-    if (!username) return;
+    if (!username) {
+      showError("Usuário não colocado! Insira seu nome.");
+      return;
+    }
 
     const activeChip = roomList.querySelector(".room-chip.active");
     currentRoom = activeChip ? activeChip.dataset.room : "geral";
@@ -246,14 +265,12 @@
 
     socket.on("server_shutdown", () => {
       if (server === "primary" && !reconnecting) {
-        console.log("[SockeText] server_shutdown recebido — migrando ao secundário");
         triggerFailover();
       }
     });
 
     socket.on("server_info",  d => updateServerBadge(d.role === "primary" ? "primary" : "secondary"));
 
-    /* Sincronização em tempo real de salas criadas */
     socket.on("room_list", rooms => {
       roomList.querySelectorAll(".room-chip:not(#newRoomBtn)").forEach(c => {
         if (c.dataset.room !== "geral") c.remove();
@@ -305,7 +322,6 @@
   /* ── OUTBOX ── */
   function flushOutbox() {
     if (outbox.size === 0) return;
-    console.log(`[SockeText] Reenviando ${outbox.size} mensagem(ns) da outbox...`);
     for (const [clientMsgId, entry] of outbox) {
       _emitMessage(entry.text, entry.room, clientMsgId, entry.el);
     }
@@ -525,7 +541,6 @@
       .replace(/>/g,"&gt;").replace(/"/g,"&quot;");
   }
 
-  /* Conecta de imediato ao carregar a página para receber e sincronizar as salas disponíveis */
   connectTo("primary");
 
 })();
